@@ -1,0 +1,14 @@
+[Unit]
+Description=foidbot assistant daemon (ears, voice, tools)
+Wants=foidbot-llm.service foidbot-searxng.service foidbot-aec.service
+After=foidbot-llm.service foidbot-searxng.service foidbot-aec.service pipewire.service
+
+[Service]
+Environment=LD_LIBRARY_PATH=@NVLIBS@
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+ExecStart=@ROOT@/.venv/bin/python -u @ROOT@/daemon/assistant.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=foidbot brain (@MODEL@ on llama-server, port 8091)
+
+[Service]
+Environment=LD_LIBRARY_PATH=@ROOT@/vendor/llama
+ExecStart=@ROOT@/vendor/llama/llama-server \
+  --model @ROOT@/models/@MODEL@ \
+  --mmproj @ROOT@/models/mmproj-Qwythos-9B-v2-BF16.gguf \
+  --alias foidbot -c @CTX@ -fa on -ctk q8_0 -ctv q8_0 --fit on \
+  --spec-type draft-mtp --jinja --host 127.0.0.1 --port 8091 \
+  --cache-ram 1024
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

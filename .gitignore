@@ -1,0 +1,19 @@
+# your settings and everything she records or learns about you
+config/foidbot.toml
+data/
+
+# downloads and environments (install.sh recreates them)
+.venv/
+models/
+vendor/
+assets/avatar/frames/
+
+# wake-word training: upstream checkouts, its env, ~22 GB of data, work files
+wakeword/.venv/
+wakeword/openWakeWord/
+wakeword/piper-sample-generator/
+wakeword/data/
+wakeword/work/
+
+__pycache__/
+*.pyc

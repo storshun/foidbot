@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Teach her your voice (and check her wake word on it). About 6 minutes.
+
+    foidbot-enroll            mic check, 20 sentences, 24 wake phrases, then build everything
+    foidbot-enroll --voice    only the sentences (voiceprint)
+    foidbot-enroll --wake     only the wake phrases
+    foidbot-enroll --build    skip recording; rebuild from what's already in data/voice/
+
+Recordings go to data/voice/user/ and data/voice/wake/ (16 kHz WAV, from the same echo-cancelled mic she listens
+with). The voiceprint goes to data/voiceprint.json. She ignores the wake word while this runs.
+"""
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+VENV = ROOT / ".venv"
+# run in the venv, with its CUDA libraries (cuBLAS/cuDNN for Whisper) on the library path
+NV = ":".join(sorted({str(p.resolve()) for p in VENV.glob("lib*/python3*/site-packages/nvidia/*/lib")}))
+if (VENV / "bin/python").exists() and (sys.prefix != str(VENV) or NV not in os.environ.get("LD_LIBRARY_PATH", "")):
+    os.environ["LD_LIBRARY_PATH"] = NV + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    os.execv(VENV / "bin/python", [str(VENV / "bin/python"), *sys.argv])
+
+import json
+import random
+import re
+import select
+import subprocess
+import time
+
+import numpy as np
+import soundfile as sf
+
+sys.path.insert(0, str(ROOT / "daemon"))
+import config  # noqa: E402
+
+CFG = config.load()
+NAME, CITY = CFG["assistant"]["name"], CFG["location"]["name"].split(",")[0]
+VOICE, WAKE = ROOT / "data/voice/user", ROOT / "data/voice/wake"
+LIBRI = ROOT / "wakeword/data/libri/LibriSpeech/dev-clean"
+SR, BLOCK = 16000, 512
+
+SENTENCES = [
+    f"What's the weather going to be like in {CITY} this afternoon?",
+    "Remind me to call the pharmacy tomorrow at nine thirty in the morning.",
+    "Can you look up when the hardware store closes tonight?",
+    "How did the market do today, and where did Nvidia close?",
+    "Open the file manager and show me what's in my downloads.",
+    "Set a timer for twelve minutes, I've got something in the oven.",
+    "Read me the top three headlines, but skip anything about sports.",
+    "Who wrote the soundtrack for Chrono Trigger, and when did it come out?",
+    "Turn the volume down a little, it's way too loud right now.",
+    "Take a note: call the landlord about the leaking kitchen faucet.",
+    "Is there any severe weather headed our way in the next day or so?",
+    "Pause the music for a minute while I take this phone call.",
+    "Search my notes for anything about the birthday party plans.",
+    "What does that error on my screen actually mean?",
+    "Tell me something interesting you learned today, keep it short.",
+    "Find the cheapest price you can for a pair of studio headphones.",
+    "Let's talk to Claude Code and see how the build is going.",
+    "Thanks, that's all I needed. Good night, I'm heading to bed.",
+    "Honestly, I think the second option looks a lot better than the first.",
+    "Copy that address to my clipboard so I can paste it into the form.",
+]
+WAKE_PROMPTS = [(p.replace("Schala", NAME), h) for p, h in [
+    ("Hey Schala", "normally"), ("Okay Schala", "normally"), ("Hey Schala", "quietly"), ("Okay Schala", "quietly"),
+    ("Hey Schala", "a little louder"), ("Okay Schala", "quickly"), ("Hey Schala", "slowly"),
+    ("Okay Schala", "leaning back from the desk"), ("Hey Schala", "looking away from the mic"),
+    ("Okay Schala", "like you just woke up"), ("Hey Schala", "casually, mid-thought"), ("Okay Schala", "a little louder"),
+    ("Hey Schala, what time is it?", "as one sentence"), ("Okay Schala, what's the weather?", "as one sentence"),
+    ("Hey Schala", "quickly"), ("Okay Schala", "slowly"), ("Hey Schala", "leaning back from the desk"),
+    ("Okay Schala", "looking away from the mic"), ("Hey Schala, set a timer for five minutes", "as one sentence"),
+    ("Okay Schala, open my music", "as one sentence"), ("Hey Schala", "normally"), ("Okay Schala", "normally"),
+    ("Hey Schala", "with a little more energy"), ("Okay Schala", "softly"),
+]]
+
+
+def ctl(*args):
+    subprocess.run([str(ROOT / "bin/foidbot-ctl"), *args], capture_output=True)
+
+
+class Mic:
+    """Same input path as the daemon: the echo-cancelled source if it exists, read with pw-record."""
+
+    def __init__(self):
+        from assistant import Silero
+        self.vad = Silero()
+        out = subprocess.run(["pw-cli", "ls", "Node"], capture_output=True, text=True).stdout
+        src = CFG["ears"]["device"]
+        target = ["--target", src] if src and f'node.name = "{src}"' in out else []
+        self.p = subprocess.Popen(["pw-record", *target, "--rate", str(SR), "--channels", "1", "--format", "f32",
+                                   "--raw", "--latency", "32ms", "-P", "{ node.name = foidbot_enroll }", "-"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.fd, self.buf = self.p.stdout.fileno(), b""
+        self.source = "echo-cancelled mic" if target else "default mic"
+
+    def drain(self):
+        while select.select([self.fd], [], [], 0)[0]:
+            os.read(self.fd, 65536)
+        self.buf = b""
+
+    def block(self):
+        while len(self.buf) < BLOCK * 4:
+            if not select.select([self.fd], [], [], 3)[0]:
+                raise RuntimeError("the microphone stopped sending audio")
+            self.buf += os.read(self.fd, 65536)
+        b, self.buf = self.buf[:BLOCK * 4], self.buf[BLOCK * 4:]
+        return np.frombuffer(b, np.float32).copy()
+
+    def seconds(self, s):
+        return np.concatenate([self.block() for _ in range(int(s * SR / BLOCK))])
+
+    def utterance(self, wait=8.0, end_silence=0.9, max_len=15.0):
+        """Record from the first speech until a pause. None if nothing was said."""
+        self.drain()
+        self.vad.reset()
+        pre, buf, speaking, silent, t0 = [], [], False, 0, time.time()
+        while True:
+            c = self.block()
+            p = self.vad(c)
+            if not speaking:
+                pre = (pre + [c])[-10:]
+                if p > 0.5:
+                    speaking, buf = True, pre[:]
+                elif time.time() - t0 > wait:
+                    return None
+                continue
+            buf.append(c)
+            silent = silent + 1 if p < 0.35 else 0
+            if silent * BLOCK / SR >= end_silence or len(buf) * BLOCK / SR > max_len:
+                tail = int(0.25 * SR / BLOCK)   # keep a little silence after the words
+                return np.concatenate(buf[:len(buf) - silent + tail])
+
+    def close(self):
+        self.p.kill()
+
+
+def level(a):
+    return 20 * np.log10(np.sqrt(np.mean(a ** 2)) + 1e-9)
+
+
+def ask(prompt):
+    try:
+        return input(prompt).strip().lower()
+    except EOFError:
+        return ""
+
+
+def mic_check(mic):
+    print(f"\nMic check ({mic.source}). Stay quiet for 3 seconds…")
+    noise = level(mic.seconds(3))
+    print("Now say: “testing, one, two, three.”")
+    a = mic.utterance()
+    if a is None:
+        print("  I didn't hear anything. Check that your mic isn't muted, then run this again.")
+        sys.exit(1)
+    snr = level(a) - noise
+    print(f"  background {noise:.0f} dB, voice {level(a):.0f} dB  ->  {snr:.0f} dB above the room"
+          + ("  (good)" if snr > 20 else "  (a bit low; move closer or quiet the room if you can)"))
+
+
+def record_sentences(mic):
+    VOICE.mkdir(parents=True, exist_ok=True)
+    print(f"\n— Part 1 of 2: {len(SENTENCES)} sentences —\nRead each one the way you'd normally talk to {NAME}. "
+          "Press Enter, then speak. It stops by itself when you pause.\n(After each one: Enter keeps it, r redoes it.)")
+    for i, line in enumerate(SENTENCES, 1):
+        while True:
+            ask(f"\n[{i}/{len(SENTENCES)}] Press Enter, then read:\n    “{line}”")
+            a = mic.utterance()
+            if a is None or len(a) < 1.2 * SR:
+                print("  That was too short or I didn't catch it; let's try again.")
+                continue
+            print(f"  got {len(a) / SR:.1f} s at {level(a):.0f} dB")
+            if ask("  Enter = keep, r = redo: ") != "r":
+                sf.write(VOICE / f"s{i:02d}.wav", a, SR)
+                break
+
+
+def record_wake(mic):
+    WAKE.mkdir(parents=True, exist_ok=True)
+    print(f"\n— Part 2 of 2: {len(WAKE_PROMPTS)} wake phrases —\nThese run by themselves: say each one when it "
+          "appears, the way it says. Pause briefly after each.")
+    ask("Press Enter to start.")
+    for i, (phrase, how) in enumerate(WAKE_PROMPTS, 1):
+        for attempt in range(3):
+            print(f"\n[{i}/{len(WAKE_PROMPTS)}] Say “{phrase}”  ({how})")
+            a = mic.utterance(wait=7)
+            if a is not None and 0.4 * SR < len(a) < 6 * SR:
+                sf.write(WAKE / f"w{i:02d}_{re.sub(r'[^a-z]+', '_', phrase.lower()).strip('_')}.wav", a, SR)
+                print(f"  ✓ {len(a) / SR:.1f} s")
+                break
+            print("  Didn't catch that one; again please.")
+        time.sleep(0.4)
+
+
+def build_voiceprint():
+    from speaker import Speakers
+    files = sorted(VOICE.glob("*.wav"))
+    if len(files) < 5:
+        print("Not enough sentence recordings for a voiceprint (need at least 5).")
+        return
+    sp = Speakers(threads=8)
+    sp.mean = None
+    rng = random.Random(1)
+
+    def crop(a, lo, hi):
+        n = int(rng.uniform(lo, hi) * SR)
+        if len(a) <= n:
+            return a
+        s = rng.randrange(0, len(a) - n)
+        return a[s:s + n]
+    # a crowd of other voices: its average is removed from every embedding (sharpens the comparison a lot),
+    # and its scores show where strangers land
+    libri = sorted(LIBRI.rglob("*.flac"))
+    rng.shuffle(libri)
+    crowd = [sf.read(f, dtype="float32")[0] for f in libri[:700]]
+    mean = np.mean([sp.embed(a, center=False) for a in crowd[:300]], axis=0)
+    sp.mean = mean
+    clips = [sf.read(f, dtype="float32")[0] for f in files]
+    E = np.array([sp.embed(a) for a in clips])
+    ref = E.mean(0)
+    ref /= np.linalg.norm(ref)
+
+    def loo(i, emb):   # score against a voiceprint built without clip i
+        r = E.sum(0) - E[i]
+        return float(emb @ (r / np.linalg.norm(r)))
+    genuine = [loo(i, E[i]) for i in range(len(E))]
+    for i, a in enumerate(clips):   # short commands: 1.2-2.5 s pieces of each sentence
+        genuine += [loo(i, sp.embed(crop(a, 1.2, 2.5))) for _ in range(3)]
+    genuine += [float(sp.embed(a) @ ref) for a in (sf.read(f, dtype="float32")[0] for f in sorted(WAKE.glob("*.wav")))
+                if len(a) >= SR]
+    impostor = [float(sp.embed(crop(a, 1.2, 4.0)) @ ref) for a in crowd[300:]]
+    g, imp = np.array(genuine), np.array(impostor)
+    accept = float(np.percentile(imp, 99.5))                 # "that's you": a stranger almost never gets here
+    reject = float(min(np.percentile(g, 2), accept - 0.05))  # "that's someone else": you almost never drop below
+    data = {"embedding": ref.round(6).tolist(), "mean": mean.round(6).tolist(),
+            "accept": round(accept, 4), "reject": round(reject, 4), "made": time.strftime("%Y-%m-%d %H:%M"),
+            "clips": len(files), "you_median": round(float(np.median(g)), 3),
+            "strangers_median": round(float(np.median(imp)), 3),
+            "you_recognized_pct": round(float((g >= accept).mean() * 100), 1),
+            "you_mistaken_pct": round(float((g < reject).mean() * 100), 1),
+            "strangers_recognized_as_you_pct": round(float((imp >= accept).mean() * 100), 2),
+            "strangers_flagged_pct": round(float((imp < reject).mean() * 100), 1)}
+    (ROOT / "data/voiceprint.json").write_text(json.dumps(data, indent=1))
+    print(f"\nVoiceprint saved from {len(files)} sentences.\n"
+          f"  You: recognized on {data['you_recognized_pct']}% of short clips (needed to talk over her); mistaken for "
+          f"someone else {data['you_mistaken_pct']}% of the time.\n"
+          f"  Strangers: taken for you {data['strangers_recognized_as_you_pct']}% of the time; recognized as someone "
+          f"else {data['strangers_flagged_pct']}% of the time.")
+    if data["you_recognized_pct"] < 50:
+        print("  Recognition is weak; recording more sentences (foidbot-enroll --voice) in your usual spot should help.")
+
+
+def eval_wake():
+    model = config.path(CFG["ears"]["wake_model"])
+    clips = sorted(WAKE.glob("*.wav"))
+    if not model.exists() or not clips:
+        print("\n(Wake-word check skipped: " + ("model not trained yet)" if not model.exists() else "no wake recordings)"))
+        return
+    from openwakeword.model import Model
+
+    def peak(a):
+        m = Model(wakeword_models=[str(model)], inference_framework="onnx")
+        x = np.concatenate([np.zeros(SR, np.float32), a, np.zeros(SR, np.float32)])
+        x = (np.clip(x, -1, 1) * 32767).astype(np.int16)
+        return max(max(m.predict(x[i:i + 1280]).values()) for i in range(0, len(x) - 1280, 1280))
+    pos = np.array([peak(sf.read(f, dtype="float32")[0]) for f in clips])
+    neg = np.array([peak(sf.read(f, dtype="float32")[0]) for f in sorted(VOICE.glob("*.wav"))])
+    print("\nWake word on your voice:")
+    best, fallback = None, (-1, 0.5)
+    for t in (0.2, 0.3, 0.4, 0.5, 0.6, 0.7):
+        hit, fa = (pos >= t).mean() * 100, (neg >= t).sum()
+        print(f"  threshold {t:.1f}: catches {hit:.0f}% of your wake phrases, fires on {fa} of {len(neg)} normal sentences")
+        if hit >= 90 and fa == 0 and t >= 0.5 and best is None:   # lowest safe one: misses fewer, TV rarely hits 0.5
+            best = t
+        if t >= 0.3 and fa == 0 and hit > fallback[0]:     # below 0.3 it fires on TV/chatter (validation set)
+            fallback = (hit, t)
+    cfg = config.CONFIG
+    text = cfg.read_text()
+    if best is None:
+        print("  It isn't reliable enough on your voice yet; keeping the Whisper wake check in charge (wake_engine = both).")
+        best = fallback[1]
+    new = re.sub(r"(?m)^oww_threshold = .*$", f"oww_threshold = {best}", text)
+    if new == text and "oww_threshold" not in text:
+        new = text.replace("[ears]\n", f"[ears]\noww_threshold = {best}\n", 1)
+    cfg.write_text(new)
+    json.dump({"pos": pos.round(3).tolist(), "neg": neg.round(3).tolist(), "threshold": best},
+              open(ROOT / "data/wake_eval.json", "w"))
+    print(f"  Using threshold {best} (saved in config/foidbot.toml).")
+
+
+def main():
+    args = set(sys.argv[1:])
+    if args & {"-h", "--help"}:
+        sys.exit(__doc__)
+    do_voice = not args or "--voice" in args
+    do_wake = not args or "--wake" in args
+    if do_voice or do_wake:
+        print(__doc__.split("\n\n")[0])
+        ctl("mute", "on")
+        mic = Mic()
+        try:
+            mic_check(mic)
+            if do_voice:
+                record_sentences(mic)
+            if do_wake:
+                record_wake(mic)
+        except KeyboardInterrupt:
+            print("\nStopped. What you recorded so far is saved; run again any time.")
+        finally:
+            mic.close()
+            ctl("mute", "off")
+    print("\nBuilding…")
+    build_voiceprint()
+    eval_wake()
+    subprocess.run(["systemctl", "--user", "try-restart", "foidbot"])
+    print(f"\nDone. {NAME} has been restarted with your voiceprint.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,71 @@
+# foidbot settings. `foidbot-onboard` writes config/foidbot.toml from this file; edit it freely afterwards,
+# then restart the daemon:  systemctl --user restart foidbot
+
+[assistant]
+name = "Schala"             # what you call her; her wake words are "Hey <name>" and "Okay <name>"
+say_as = "Schala"           # spelling her voice uses so the name sounds right (onboarding sets this)
+phonemes = ""               # her name in ARPAbet, e.g. "SH AA1 L AH0"; empty = worked out from say_as
+voice = "af_heart"          # Kokoro voice: af_heart, af_bella, af_nicole, bf_emma, ... (foidbot-onboard plays samples)
+speed = 1.0
+personality = "gentle, demure, confident, wise and protective"
+# Only shown when it's just you (no call, screen share or other voice nearby):
+private_side = "playful, teasing, flirtatious, frank about any topic including adult ones"   # "" turns it off
+
+[user]
+name = "Friend"
+pronouns = "they"           # he | she | they
+
+[location]
+name = "Houston, TX"
+lat = 29.7604
+lon = -95.3698
+
+[daemon]
+port = 8770                 # websocket between the daemon, the widget and foidbot-ctl
+
+[llm]
+url = "http://127.0.0.1:8091/v1/chat/completions"
+temperature = 0.7
+history_turns = 16
+
+[heavy]                     # optional bigger brain for website tasks, started only when enough VRAM is free
+enabled = false
+url = "http://127.0.0.1:8092/v1/chat/completions"
+min_free_vram_gb = 20.5
+
+[search]
+searxng = "http://127.0.0.1:8888"
+
+[ears]
+whisper_model = "large-v3-turbo"
+wake_model = "models/wake.onnx"   # trained for her name by foidbot-onboard / foidbot-train-wake
+# Spellings Whisper writes when it hears her name (onboarding fills this in by listening to her voice):
+wake_words = ["schala"]
+end_silence_ms = 700        # pause that ends your sentence
+listen_timeout_s = 8        # give up if you say nothing after waking her
+follow_up = "questions"     # after she asks you something, listen without the wake word | always | off
+follow_up_timeout_s = 8     # how long she waits for that answer
+follow_up_chime = false     # chime when she starts waiting (the avatar shows "listening" either way)
+device = "foidbot_aec_source" # echo-cancelled mic from foidbot-aec.service ("" = default mic)
+wake_engine = "both"        # both: wake-word model OR Whisper hearing her name | oww: model only (less GPU) | whisper
+oww_threshold = 0.5
+barge_in = true             # talking over her (in your own voice) interrupts her
+
+[wake]
+# Phrases the wake-word model learns to ignore: everyday words that sound like her name (onboarding asks her
+# brain for these). Empty = picked from the pronunciation dictionary. Re-run foidbot-train-wake after changing.
+negatives = []
+
+[notes]
+dir = "~/Documents/Notes"   # a folder of Markdown files; an Obsidian vault works
+folder = "Schala"           # subfolder for her daily notes
+
+[desktop]
+screenshot = "auto"         # auto | spectacle | grim | gnome-screenshot
+
+[claude_code]
+enabled = true              # "talk to Claude Code": relay your words into a running Claude Code session
+
+[log]
+transcript_days = 30        # data/transcripts/<date>.log: what she heard, said and did; older days are deleted
+log_heard = true            # include everything Whisper transcribes (even speech not meant for her)

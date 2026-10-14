@@ -1,0 +1,11 @@
+[Unit]
+Description=foidbot echo-cancelled microphone
+After=pipewire.service
+Requires=pipewire.service
+
+[Service]
+ExecStart=/usr/bin/pipewire -c @ROOT@/config/aec.conf
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

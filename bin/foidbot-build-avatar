@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Builds the layered avatar from the full-size expression art.
+
+foidbot-build-avatar [SOURCE_DIR]   (SOURCE_DIR: import a new set of PNGs into assets/avatar/src first)
+
+Sources (1408x1408 RGBA, identical framing) live in assets/avatar/src/ with snake_case names.
+Output in assets/avatar/frames/:
+  <expression>.png            portrait bust crop, one per source image
+  mouth_<family>_<level>.png  full-canvas overlays (transparent except the lower face) for lip sync
+  blink.png                   full-canvas overlay of closed eyes (from sleep), drawn over open-eyed expressions
+Which expression each mood/state uses lives in assets/avatar/avatar.toml (the widget reads it).
+"""
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+VENV = ROOT / ".venv"
+if Path(sys.prefix).resolve() != VENV.resolve() and (VENV / "bin/python").exists():
+    os.execv(str(VENV / "bin/python"), [str(VENV / "bin/python"), __file__, *sys.argv[1:]])
+
+import numpy as np  # noqa: E402
+from PIL import Image, ImageDraw, ImageFilter  # noqa: E402
+from scipy.ndimage import gaussian_filter  # noqa: E402
+
+SRC = ROOT / "assets/avatar/src"
+OUT = ROOT / "assets/avatar/frames"
+
+CROP = (280, 0, 1120, 1120)   # bust framing in source pixels (3:4)
+SIZE = (768, 1024)
+RENAME = {"fown 2": "frown_2"}  # typo in the first-pass names
+
+# Mouth sources per family: small (u), mid (e/o), wide (a). Each is cut from the lower face of that expression.
+MOUTHS = {
+    "neutral": {"small": "look_away", "mid": "horrified", "wide": "shocked"},
+    "smile": {"small": "grin_2", "mid": "grin", "wide": "laugh"},
+    "angry": {"small": "look_away", "mid": "rage", "wide": "yell"},
+}
+# Lower face (source px): under the nose, up to the high grin corner on the right (3/4 view), down past both
+# chin positions (the jaw drops when she opens wide). Traced on grin_3 / laugh / shocked / smile_5.
+LOWER_FACE = [(636, 600), (668, 584), (700, 579), (760, 556), (818, 530), (850, 548), (836, 622),
+              (812, 690), (782, 728), (728, 734), (676, 704), (626, 652)]
+FACE_FEATHER = 7
+EYES = [((776, 424), (72, 35)), ((598, 473), (66, 35))]  # her left eye (screen right), her right eye
+EYE_FEATHER = 12
+
+
+def clean(name):
+    name = RENAME.get(name, name)
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def import_sources(src_dir):
+    SRC.mkdir(parents=True, exist_ok=True)
+    for p in sorted(src_dir.glob("*.png")):
+        shutil.copy2(p, SRC / f"{clean(p.stem)}.png")
+
+
+def load(name):
+    return Image.open(SRC / f"{name}.png").convert("RGBA")
+
+
+def ellipse_mask(shapes, feather):
+    m = Image.new("L", (1408, 1408), 0)
+    d = ImageDraw.Draw(m)
+    for (cx, cy), (rx, ry) in shapes:
+        # shrink by the feather so the soft edge stays inside the drawn shape
+        d.ellipse((cx - rx + feather, cy - ry + feather, cx + rx - feather, cy + ry - feather), fill=255)
+    return m.filter(ImageFilter.GaussianBlur(feather / 2))
+
+
+def overlay(src, mask):
+    """Source pixels limited to the mask, everything else transparent."""
+    a = np.asarray(src).copy()
+    a[..., 3] = (a[..., 3].astype(np.uint16) * np.asarray(mask) // 255).astype(np.uint8)
+    return Image.fromarray(a)
+
+
+def defringe(img):
+    """The art was cut out from a white background, so soft edges carry a white halo. Recolour every
+    semi-transparent pixel from the nearby solid pixels (normalised blur fill) and keep its alpha."""
+    a = np.asarray(img).astype(np.float32)
+    solid = (a[..., 3] >= 235).astype(np.float32)
+    fill, weight = np.zeros_like(a[..., :3]), np.zeros_like(solid)
+    for sigma in (2, 6, 18):   # small first, wider passes only fill what is still empty
+        w = gaussian_filter(solid, sigma)
+        c = np.stack([gaussian_filter(a[..., i] * solid, sigma) for i in range(3)], -1)
+        take = (weight < 1e-3) & (w > 1e-3)
+        fill[take] = c[take] / w[take, None]
+        weight[take] = w[take]
+    edge = (a[..., 3] < 235) & (weight > 1e-3)
+    a[edge, :3] = fill[edge]
+    return Image.fromarray(a.clip(0, 255).astype(np.uint8))
+
+
+def finish(img):
+    return img.crop(CROP).resize(SIZE, Image.LANCZOS)
+
+
+def main():
+    src_dir = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else None
+    if src_dir:
+        import_sources(src_dir)
+    if not any(SRC.glob("*.png")):
+        sys.exit(f"no expression art in {SRC}; pass a folder of PNGs to import")
+    OUT.mkdir(parents=True, exist_ok=True)
+    names = sorted(p.stem for p in SRC.glob("*.png"))
+    for n in names:
+        finish(defringe(load(n))).save(OUT / f"{n}.png", optimize=True)
+    face = Image.new("L", (1408, 1408), 0)
+    ImageDraw.Draw(face).polygon(LOWER_FACE, fill=255)
+    face = face.filter(ImageFilter.GaussianBlur(FACE_FEATHER))
+    for fam, levels in MOUTHS.items():
+        for level, n in levels.items():
+            finish(overlay(load(n), face)).save(OUT / f"mouth_{fam}_{level}.png", optimize=True)
+    finish(overlay(load("sleep"), ellipse_mask(EYES, EYE_FEATHER))).save(OUT / "blink.png", optimize=True)
+    print(f"{len(names)} expressions + {sum(map(len, MOUTHS.values()))} mouths + blink -> {OUT}")
+
+
+if __name__ == "__main__":
+    main()

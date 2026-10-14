@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Train her wake word ("Hey <name>" / "Okay <name>") on this machine, for the name in config/foidbot.toml.
+
+    foidbot-train-wake             run every step, or resume where a stopped run left off
+    foidbot-train-wake --quick     fewer synthetic clips: roughly half the time, slightly less accurate
+    foidbot-train-wake --status    how far a running or finished training got
+    foidbot-train-wake --restart   throw the work away and start over (renaming her does this automatically)
+    foidbot-train-wake --keep      keep the ~10 GB of intermediate clips afterwards
+
+About 1-2 hours on a recent NVIDIA GPU, plus a ~22 GB download the first time. Needs the training environment
+from `./install.sh --train` and about 40 GB of free disk. Progress is logged to wakeword/work/train.log.
+Until a model exists she still wakes when Whisper hears her name, so nothing is broken while this runs.
+"""
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+VENV = ROOT / ".venv"
+# run in the venv, with its CUDA libraries (cuBLAS/cuDNN for Whisper) on the library path
+NV = ":".join(sorted({str(p.resolve()) for p in VENV.glob("lib*/python3*/site-packages/nvidia/*/lib")}))
+if (VENV / "bin/python").exists() and (sys.prefix != str(VENV) or NV not in os.environ.get("LD_LIBRARY_PATH", "")):
+    os.environ["LD_LIBRARY_PATH"] = NV + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    os.execv(VENV / "bin/python", [str(VENV / "bin/python"), *sys.argv])
+
+import json
+import re
+import shutil
+import subprocess
+import time
+
+sys.path.insert(0, str(ROOT / "daemon"))
+sys.path.insert(0, str(ROOT / "wakeword"))
+import config  # noqa: E402
+import names  # noqa: E402
+
+WW = ROOT / "wakeword"
+WORK, DATA = WW / "work", WW / "data"
+TRAIN_PY = WW / ".venv/bin/python"
+OWW_TRAIN = WW / "openWakeWord/openwakeword/train.py"
+LOG = WORK / "train.log"
+MODEL_NAME = "wake"
+SMOKE = os.environ.get("FOIDBOT_TRAIN_SMOKE") == "1"   # developers: tiny run to test the pipeline end to end
+GENERIC_NEGATIVES = ["hey siri", "hey google", "okay google", "hey alexa", "hey there", "okay then"]
+
+
+def log(*a):
+    line = time.strftime("%H:%M:%S ") + " ".join(str(x) for x in a)
+    print(line, flush=True)
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def run(cmd, env=None, cwd=WW):
+    """Run a step, its output appended to the log; stop the whole training if it fails."""
+    with open(LOG, "a") as f:
+        f.write(f"\n$ {' '.join(map(str, cmd))}\n")
+        f.flush()
+        p = subprocess.run([str(c) for c in cmd], cwd=cwd, stdout=f, stderr=subprocess.STDOUT,
+                           env={**os.environ, **(env or {})})
+    if p.returncode:
+        tail = LOG.read_text(errors="replace").replace("\r", "\n").strip().splitlines()[-15:]
+        log(f"FAILED (exit {p.returncode}). Last lines of {LOG}:")
+        print("\n".join("    " + t for t in tail))
+        sys.exit(1)
+
+
+class Plan:
+    """Everything that depends on her name; a change of name or pronunciation means starting over."""
+
+    def __init__(self, cfg, quick):
+        a = cfg["assistant"]
+        self.name, self.say_as = a["name"], a.get("say_as") or a["name"]
+        self.words = self.say_as.lower().split()
+        self.phones = a.get("phonemes") or " ".join(names.arpabet(w) for w in self.words)
+        self.quick = quick
+        self.phrases = [f"hey {self.say_as.lower()}", f"okay {self.say_as.lower()}"]
+        negs = cfg.get("wake", {}).get("negatives") or [f"hey {w}" for w in names.sound_alikes(self.phones, 10)]
+        self.negatives = sorted({n.lower() for n in negs + GENERIC_NEGATIVES} - set(self.phrases))
+
+    def signature(self):
+        return json.dumps({"say_as": self.say_as, "phones": self.phones, "quick": self.quick,
+                           "negatives": self.negatives}, sort_keys=True)
+
+    def extra_phones(self):
+        """OWW_EXTRA_PHONES for the patched openWakeWord: phonemes for words CMUdict doesn't know."""
+        if len(self.words) == 1:
+            return {self.words[0]: [self.phones]}
+        return {w: [names.arpabet(w)] for w in self.words}
+
+
+def write_yaml(plan, have_user):
+    n, steps = (20000, 30000) if plan.quick else (50000, 50000)
+    if SMOKE:
+        n, steps = 300, 300
+    out = WORK / "out"
+    feats = {"ACAV100M_sample": DATA / "openwakeword_features_ACAV100M_2000_hrs_16bit.npy",
+             "positive_kokoro": WORK / "kokoro_features.npy"}
+    batch = {"ACAV100M_sample": 1024, "adversarial_negative": 50, "positive": 36, "positive_kokoro": 14}
+    if have_user:
+        feats["positive_user"] = WORK / "user_features.npy"
+        batch["positive_user"] = 6
+    else:
+        batch["positive"] = 40
+        batch["positive_kokoro"] = 16
+    q = lambda v: json.dumps(str(v))   # YAML accepts JSON strings
+    lines = [f'model_name: "{MODEL_NAME}"', "target_phrase:", *[f"  - {q(p)}" for p in plan.phrases],
+             "custom_negative_phrases:", *[f"  - {q(p)}" for p in plan.negatives],
+             f"n_samples: {n}", f"n_samples_val: {n // 10}", "tts_batch_size: 50", "augmentation_batch_size: 16",
+             f"piper_sample_generator_path: {q(WW / 'piper-sample-generator')}", f"output_dir: {q(out)}",
+             "rir_paths:", f"  - {q(DATA / 'mit_rirs')}", "background_paths:", f"  - {q(DATA / 'background')}",
+             "background_paths_duplication_rate:", "  - 1",
+             f"false_positive_validation_data_path: {q(DATA / 'validation_set_features.npy')}",
+             "augmentation_rounds: 1", "feature_data_files:", *[f"  {q(k)}: {q(v)}" for k, v in feats.items()],
+             "batch_n_per_class:", *[f"  {q(k)}: {v}" for k, v in batch.items()],
+             'model_type: "dnn"', "layer_size: 64", f"steps: {steps}", "max_negative_weight: 300",
+             "target_false_positives_per_hour: 0.5"]
+    (WORK / "train.yml").write_text("\n".join(lines) + "\n")
+
+
+def wake_ends(plan, cfg):
+    """Where the name ends in each recorded wake phrase (Whisper word timestamps), for cutting the clips."""
+    from difflib import SequenceMatcher
+    import soundfile as sf
+    from faster_whisper import WhisperModel
+    clips = sorted((ROOT / "data/voice/wake").glob("*.wav"))
+    aliases = {plan.name.lower(), plan.say_as.lower(), *[w.lower() for w in cfg["ears"].get("wake_words", [])]}
+    model = WhisperModel(cfg["ears"]["whisper_model"], device="cuda", compute_type="float16")
+    ends = {}
+    for f in clips:
+        audio, _ = sf.read(f, dtype="float32")   # 16 kHz mono from foidbot-enroll; arrays skip PyAV decoding
+        segs, _ = model.transcribe(audio, language="en", word_timestamps=True,
+                                   initial_prompt=f"Hey {plan.name}. Okay {plan.name}.")
+        words = [w for s in segs for w in s.words]
+        for i, w in enumerate(words):
+            t = re.sub(r"[^a-z]", "", w.word.lower())
+            if t and (t in aliases or max(SequenceMatcher(None, t, a).ratio() for a in aliases) > 0.6):
+                ends[str(f)] = round(w.end, 2)
+                break
+        else:   # fall back to the word after "hey"/"okay"
+            for i, w in enumerate(words[:-1]):
+                if re.sub(r"[^a-z]", "", w.word.lower()) in ("hey", "okay", "ok", "hay"):
+                    ends[str(f)] = round(words[i + 1].end, 2)
+                    break
+    del model
+    (WORK / "wake_ends.json").write_text(json.dumps(ends, indent=1))
+    log(f"name found in {len(ends)} of {len(clips)} of your wake recordings")
+    return len(ends)
+
+
+def vram_free_gb():
+    out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                         capture_output=True, text=True).stdout.split()
+    return int(out[0]) / 1024 if out else 0
+
+
+def status():
+    if not WORK.exists():
+        print("No wake-word training has been started.")
+        return
+    done = sorted(p.stem for p in WORK.glob("*.done"))
+    print("Finished steps:", ", ".join(done) or "none")
+    if LOG.exists():
+        lines = [x for x in LOG.read_text(errors="replace").splitlines() if re.match(r"\d\d:\d\d:\d\d ", x)]
+        print("\n".join(lines[-6:]))
+    active = subprocess.run(["systemctl", "--user", "is-active", "foidbot-train-wake"], capture_output=True,
+                            text=True).stdout.strip()
+    print("Running in the background." if active == "active" else "")
+
+
+def main():
+    args = set(sys.argv[1:])
+    if args & {"-h", "--help"}:
+        sys.exit(__doc__)
+    if "--status" in args:
+        return status()
+    if not TRAIN_PY.exists() or not OWW_TRAIN.exists():
+        sys.exit("The training environment isn't installed. Run:  ./install.sh --train")
+    cfg = config.load()
+    plan = Plan(cfg, quick="--quick" in args)
+    sig = WORK / "signature.json"
+    if "--restart" in args or (sig.exists() and sig.read_text() != plan.signature()):
+        if sig.exists():
+            print("Starting over" + (" (her name or settings changed)." if "--restart" not in args else "."))
+        shutil.rmtree(WORK, ignore_errors=True)
+    WORK.mkdir(parents=True, exist_ok=True)
+    sig.write_text(plan.signature())
+    log(f"Training the wake word for “Hey {plan.name}” / “Okay {plan.name}”  (spoken as “{plan.say_as}”, "
+        f"phonemes {plan.phones}){'  [quick]' if plan.quick else ''}")
+    log("sound-alikes it learns to ignore:", ", ".join(plan.negatives))
+
+    have_user = any((ROOT / "data/voice/wake").glob("*.wav"))
+    env = {"OWW_EXTRA_PHONES": json.dumps(plan.extra_phones())}
+    llm_stopped = False
+    piper_model = WW / "piper-sample-generator/models/en-us-libritts-high.pt"
+
+    def step(key, what, minutes, fn):
+        nonlocal llm_stopped
+        marker = WORK / f"{key}.done"
+        if marker.exists():
+            return
+        if key in ("piper", "augment", "train") and vram_free_gb() < 6 and not llm_stopped:
+            r = subprocess.run(["systemctl", "--user", "is-active", "foidbot-llm"], capture_output=True, text=True)
+            if r.stdout.strip() == "active":
+                log("pausing her brain (foidbot-llm) to free GPU memory; it restarts when training ends")
+                subprocess.run(["systemctl", "--user", "stop", "foidbot-llm"])
+                llm_stopped = True
+        log(f"▶ {what} (about {minutes})")
+        t = time.time()
+        fn()
+        marker.touch()
+        log(f"✓ {what} in {(time.time() - t) / 60:.0f} min")
+
+    try:
+        step("data", "downloading training data", "20-60 min, depends on your connection", lambda: (
+            run([sys.executable, ROOT / "setup/fetch.py", "train"], cwd=ROOT),
+            run([TRAIN_PY, WW / "prepare_data.py", DATA])))
+        if not piper_model.exists():
+            shutil.copy(DATA / "en_US-libritts_r-medium.pt", piper_model)
+        step("config", "writing the training config", "a moment", lambda: write_yaml(plan, have_user))
+        yml = WORK / "train.yml"
+        step("piper", "synthesizing ~100k clips of her name in 900+ voices", "15-30 min",
+             lambda: run([TRAIN_PY, OWW_TRAIN, "--training_config", yml, "--generate_clips"], env))
+        def kokoro():
+            procs = [subprocess.Popen([sys.executable, WW / "gen_kokoro.py", WORK / "kokoro_pos", str(seed), "20" if SMOKE else "1500",
+                                       f"Hey {plan.say_as}", f"Okay {plan.say_as}"],
+                                      cwd=WW, stdout=open(LOG, "a"), stderr=subprocess.STDOUT) for seed in (1, 2, 3, 4)]
+            if any(p.wait() for p in procs):
+                log(f"FAILED: Kokoro clip generation (see {LOG})")
+                sys.exit(1)
+        step("kokoro", "a second voice family (Kokoro) saying her name", "5-15 min", kokoro)
+        step("augment", "adding room echo and background noise", "15-30 min",
+             lambda: run([TRAIN_PY, OWW_TRAIN, "--training_config", yml, "--augment_clips"], env))
+        step("kokoro_features", "processing the Kokoro clips", "5 min",
+             lambda: run([TRAIN_PY, WW / "kokoro_features.py", WORK, DATA]))
+        if have_user:
+            def user():
+                if wake_ends(plan, cfg):
+                    run([TRAIN_PY, WW / "user_features.py", WORK, DATA, WORK / "wake_ends.json"])
+            step("user", "your own recordings", "2-5 min", user)
+            if not (WORK / "user_features.npy").exists():   # Whisper couldn't place the name in any clip
+                write_yaml(plan, False)
+        step("train", "training the model", "15-40 min",
+             lambda: run([TRAIN_PY, OWW_TRAIN, "--training_config", yml, "--train_model"], env))
+    finally:
+        if llm_stopped:
+            subprocess.run(["systemctl", "--user", "start", "foidbot-llm"])
+            log("restarted foidbot-llm")
+
+    model = WORK / "out" / f"{MODEL_NAME}.onnx"
+    dest = ROOT / "models/wake.onnx"
+    if dest.exists():
+        shutil.copy(dest, dest.with_suffix(".previous.onnx"))
+    shutil.copy(model, dest)
+    text = LOG.read_text(errors="replace").replace("\r", "\n")
+    m = re.findall(r"Final Model False Positives per Hour: ([\d.]+)", text)
+    log(f"Installed {dest}" + (f"; about {float(m[-1]):.2f} false wakes per hour on everyday audio" if m else ""))
+    if have_user:   # measures it on your own recordings and picks the threshold
+        subprocess.run([ROOT / "bin/foidbot-enroll", "--build"])
+    else:
+        subprocess.run(["systemctl", "--user", "try-restart", "foidbot"], capture_output=True)
+    if "--keep" not in args:
+        for d in ("out/wake", "kokoro_pos", "user_clips"):
+            shutil.rmtree(WORK / d, ignore_errors=True)
+    log(f"Done. Say “Hey {plan.name}”.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Set up your assistant: who you are, her name and voice, then her ears (your voice and her wake word).
+
+    foidbot-onboard            the whole thing (about 15 minutes of your time; wake-word training runs on its own)
+    foidbot-onboard --rename   just give her a new name (and retrain her wake word)
+
+Run again any time; your current answers are the defaults, so Enter keeps them.
+"""
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+VENV = ROOT / ".venv"
+# run in the venv, with its CUDA libraries (cuBLAS/cuDNN for Whisper) on the library path
+NV = ":".join(sorted({str(p.resolve()) for p in VENV.glob("lib*/python3*/site-packages/nvidia/*/lib")}))
+if (VENV / "bin/python").exists() and (sys.prefix != str(VENV) or NV not in os.environ.get("LD_LIBRARY_PATH", "")):
+    os.environ["LD_LIBRARY_PATH"] = NV + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    os.execv(VENV / "bin/python", [str(VENV / "bin/python"), *sys.argv])
+
+import json
+import re
+import shutil
+import subprocess
+import time
+import tomllib
+
+import httpx
+import numpy as np
+
+sys.path.insert(0, str(ROOT / "daemon"))
+sys.path.insert(0, str(ROOT / "wakeword"))
+import config  # noqa: E402
+import names  # noqa: E402
+
+UA = {"User-Agent": "foidbot (+https://github.com/storshun/foidbot)"}
+VOICES = [("af_heart", "warm, American"), ("af_bella", "bright, American"), ("af_nicole", "soft, close-mic"),
+          ("af_sarah", "clear, American"), ("bf_emma", "gentle, British"), ("bf_isabella", "crisp, British")]
+NOT_ALIASES = {"hey", "okay", "ok", "the", "a", "you", "there", "guys", "siri", "google", "alexa", "hi", "hello"}
+
+
+# ---------------------------------------------------------------- small terminal helpers
+def bold(s):
+    return f"\033[1m{s}\033[0m"
+
+
+def section(title):
+    print(f"\n{bold('— ' + title + ' —')}")
+
+
+def ask(prompt, default=""):
+    try:
+        a = input(f"{prompt}" + (f" [{default}]" if default else "") + ": ").strip()
+    except EOFError:
+        a = ""
+    return a or default
+
+
+def yes(prompt, default=True):
+    a = ask(prompt + (" (Y/n)" if default else " (y/N)")).lower()
+    return default if not a else a.startswith("y")
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+
+
+# ---------------------------------------------------------------- config file editing (keeps the comments)
+def set_value(text, section_name, key, value):
+    v = json.dumps(value, ensure_ascii=False) if not isinstance(value, bool) else str(value).lower()
+    m = re.search(rf"(?ms)^\[{re.escape(section_name)}\]\n(.*?)(?=^\[|\Z)", text)
+    if not m:
+        return text.rstrip() + f"\n\n[{section_name}]\n{key} = {v}\n"
+    body = m.group(1)
+    line = re.compile(rf"(?m)^{re.escape(key)}\s*=\s*.*?(\s+#.*)?$")
+    if line.search(body):
+        # keep the comment column: pad the new value to where the old comment started
+        def repl(lm):
+            comment = lm.group(1) or ""
+            head = f"{key} = {v}"
+            if comment:
+                width = len(lm.group(0)) - len(comment)
+                head = head.ljust(width) if len(head) < width else head
+            return head + comment
+        body = line.sub(repl, body, count=1)
+    else:
+        body = body.rstrip("\n") + f"\n{key} = {v}\n\n"
+    return text[:m.start(1)] + body + text[m.end(1):]
+
+
+def save(values):
+    text = config.CONFIG.read_text() if config.CONFIG.exists() else config.EXAMPLE.read_text()
+    for (sec, key), v in values.items():
+        text = set_value(text, sec, key, v)
+    tomllib.loads(text)   # never write a broken file
+    config.CONFIG.write_text(text)
+
+
+# ---------------------------------------------------------------- voice
+class Voice:
+    def __init__(self):
+        from kokoro_onnx import Kokoro
+        self.k = Kokoro(str(ROOT / "models/kokoro-v1.0.onnx"), str(ROOT / "models/voices-v1.0.bin"))
+
+    def audio(self, text, voice, speed=1.0):
+        return self.k.create(text, voice=voice, speed=speed, lang="en-us")
+
+    def say(self, text, voice, speed=1.0):
+        import sounddevice as sd
+        a, sr = self.audio(text, voice, speed)
+        sd.play(a, sr)
+        sd.wait()
+
+
+# ---------------------------------------------------------------- steps
+def about_you(cfg, out):
+    section("About you")
+    name = ask("What should she call you?", cfg["user"]["name"] if cfg["user"]["name"] != "Friend" else "")
+    while not name:
+        name = ask("Your name (or a nickname)")
+    pr = ask("Your pronouns: he, she or they?", cfg["user"].get("pronouns", "they")).lower()
+    pr = pr if pr in config.PRONOUNS else "they"
+    out[("user", "name")], out[("user", "pronouns")] = name, pr
+
+    print("\nWhere are you? She uses it for weather, local news and \"near me\" (it never leaves this machine "
+          "except as a weather/map lookup).")
+    while True:
+        place = ask("City (and state or country)", cfg["location"]["name"] if config.CONFIG.exists() else "")
+        if not place:
+            continue
+        try:
+            r = httpx.get("https://nominatim.openstreetmap.org/search", headers=UA, timeout=15,
+                          params={"q": place, "format": "jsonv2", "limit": 1, "addressdetails": 1})
+            hit = r.json()[0]
+        except Exception:
+            print("  I couldn't look that up (offline, or no match). Try another spelling, or type lat,lon.")
+            m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*", place)
+            if m:
+                out[("location", "name")] = ask("Name for that place", "Home")
+                out[("location", "lat")], out[("location", "lon")] = float(m.group(1)), float(m.group(2))
+                return
+            continue
+        a = hit.get("address", {})
+        town = a.get("city") or a.get("town") or a.get("village") or a.get("county") or place.split(",")[0]
+        region = a.get("state") if a.get("country_code") == "us" else a.get("country")
+        nice = f"{town}, {region}" if region else town
+        if yes(f"  {hit['display_name'][:90]} — that's it?"):
+            out[("location", "name")] = nice
+            out[("location", "lat")], out[("location", "lon")] = round(float(hit["lat"]), 4), round(float(hit["lon"]), 4)
+            return
+
+
+def her_voice(cfg, out, voice):
+    section("Her voice")
+    current = cfg["assistant"]["voice"]
+    print("Listen to a few voices (all run locally with Kokoro). You can change it later in config/foidbot.toml.")
+    name = cfg["assistant"]["name"]
+    for i, (v, desc) in enumerate(VOICES, 1):
+        print(f"  {i}. {v:12s} {desc}" + ("   (current)" if v == current else ""))
+    while True:
+        a = ask("Number to hear it, Enter when you've picked", "")
+        if not a:
+            break
+        if a.isdigit() and 1 <= int(a) <= len(VOICES):
+            v = VOICES[int(a) - 1][0]
+            print(f"  ▶ {v}")
+            voice.say(f"Hi. I'm {cfg['assistant'].get('say_as') or name}. It's nice to finally meet you.", v)
+            current = v
+    pick = ask("Which voice? (number or name)", current)
+    if pick.isdigit() and 1 <= int(pick) <= len(VOICES):
+        pick = VOICES[int(pick) - 1][0]
+    out[("assistant", "voice")] = pick
+    return pick
+
+
+def her_name(cfg, out, voice, v):
+    section("Her name")
+    print("This is the name you'll wake her with: \"Hey <name>\" or \"Okay <name>\". Two or three syllables work "
+          "best; very short names wake her by accident more often.")
+    old = cfg["assistant"]["name"]
+    while True:
+        name = ask("Her name", old)
+        if not re.fullmatch(r"[A-Za-z][A-Za-z' -]{1,30}", name) or len(name.split()) > 2:
+            print("  Letters only please (one or two words).")
+            continue
+        say_as = cfg["assistant"].get("say_as") if name == old else name
+        say_as = say_as or name
+        while True:
+            phones = " ".join(names.arpabet(w) for w in say_as.split())
+            print(f"  ▶ \"Hey {name}\"")
+            voice.say(f"Hey {say_as}. Okay, {say_as}.", v)
+            if yes("  Did she say it right?"):
+                break
+            say_as = ask("  Type it the way it sounds (e.g. Shah-la, Kee-ra, Zef-er-een)", say_as)
+        n = names.syllables(phones)
+        if n < 2 and not yes(f"  “{name}” is one syllable, so random speech will wake her more often. Keep it?", False):
+            continue
+        break
+    print(f"  phonemes: {phones}")
+    out[("assistant", "name")], out[("assistant", "say_as")], out[("assistant", "phonemes")] = name, say_as, phones
+    if not config.CONFIG.exists() or cfg["notes"].get("folder") in (None, "", old):
+        out[("notes", "folder")] = name
+    return name, say_as, phones, name.lower() != old.lower() or say_as != cfg["assistant"].get("say_as")
+
+
+def personality(cfg, out, name):
+    section("Personality")
+    print(f"How {name} comes across. Plain words, comma-separated. Enter keeps it.")
+    out[("assistant", "personality")] = ask("Personality", cfg["assistant"]["personality"])
+    print(f"\nHer private side only shows when it's just you: no call or screen share running and no other voice "
+          f"nearby. Type \"none\" to turn it off.")
+    p = ask("Private side", cfg["assistant"]["private_side"] or "none")
+    out[("assistant", "private_side")] = "" if p.lower() == "none" else p
+
+
+def notes(cfg, out, name):
+    section("Notes")
+    vaults = []
+    for f in (Path.home() / ".config/obsidian/obsidian.json",
+              Path.home() / ".var/app/md.obsidian.Obsidian/config/obsidian/obsidian.json"):
+        try:
+            vaults += [v["path"] for v in json.loads(f.read_text()).get("vaults", {}).values()]
+        except (OSError, ValueError):
+            pass
+    current = cfg["notes"]["dir"]
+    if vaults and current == tomllib.loads(config.EXAMPLE.read_text())["notes"]["dir"]:
+        current = vaults[0]
+        print("Found your Obsidian vault" + ("s: " + ", ".join(vaults) if len(vaults) > 1 else f": {vaults[0]}"))
+    print(f"{name} saves notes you dictate (in a \"{out.get(('notes', 'folder'), name)}\" subfolder) and searches "
+          "all the Markdown notes in this folder.")
+    out[("notes", "dir")] = ask("Notes folder", current.replace(str(Path.home()), "~"))
+
+
+def wake_words(cfg, out, name, say_as, voice):
+    """Spellings Whisper writes when it hears her name, found by letting it listen to her own voice say it."""
+    section("Teaching her ears her name")
+    print("Whisper (speech recognition) will listen to several voices saying her name, so she also wakes when it "
+          "spells it differently. The first run downloads the Whisper model (~1.6 GB).")
+    from faster_whisper import WhisperModel
+    from scipy.signal import resample_poly
+    model = WhisperModel(cfg["ears"]["whisper_model"], device="cuda", compute_type="float16")
+    heard = {}
+    for v in ("af_heart", "af_bella", "af_nicole", "am_adam", "am_michael", "bf_emma", "bm_george", "af_sky"):
+        for text in (f"Hey {say_as}.", f"Okay {say_as}, what time is it?"):
+            a, sr = voice.audio(text, v, speed=1.05)
+            a16 = resample_poly(a, 16000, sr).astype(np.float32)
+            for prompt in (None, f"Hey {name}."):
+                segs, _ = model.transcribe(a16, language="en", initial_prompt=prompt, beam_size=5)
+                words = re.findall(r"[a-z']+", " ".join(s.text for s in segs).lower())
+                if words and words[0] in ("hey", "okay", "ok", "hay") and len(words) > 1:
+                    heard[words[1]] = heard.get(words[1], 0) + 1
+    del model
+    base = {name.lower(), *[w.lower() for w in say_as.split() if len(w) > 2]}
+    import pronouncing
+    found = sorted((w for w in heard if w not in NOT_ALIASES and (heard[w] > 1 or not pronouncing.phones_for_word(w))),
+                   key=lambda w: -heard[w])
+    aliases = list(dict.fromkeys([*base, *found]))[:12]
+    print("  Whisper wrote her name as: " + ", ".join(f"{w} ({heard.get(w, 0)})" for w in aliases))
+    edited = ask("  Spellings that should wake her (comma-separated; remove any everyday words)", ", ".join(aliases))
+    out[("ears", "wake_words")] = [w.strip().lower() for w in edited.split(",") if w.strip()]
+
+
+def same_sound(word, phones):
+    try:
+        return names.plain(" ".join(names.arpabet(w) for w in word.split())) == names.plain(phones)
+    except Exception:
+        return False
+
+
+def sound_alikes(cfg, name, say_as, phones, aliases):
+    """Everyday words that sound like her name but aren't it: asks her own brain (few-shot, because a small
+    model repeats itself otherwise), drops homophones, tops up from the pronunciation dictionary."""
+    prompt = (f"A voice assistant is woken by saying her name, \"{name}\" (pronounced \"{say_as}\"). List 12 "
+              "different everyday English words or common names that sound close to it but are NOT the same name, "
+              "so they could wake her by mistake: change one sound, rhyme it, or drop a syllable. No spellings of "
+              "the name itself, no repeats.\n\nExample for \"Alexa\": Alexis, Alex, election, Lexus, Electra, "
+              "Alessa, a letter, Alyssa, relax, collector, Annika, Erica\n\n"
+              f"Answer for \"{name}\" in the same form: one comma-separated line.")
+    words = []
+    for _ in range(40):   # her brain may still be loading
+        try:
+            r = httpx.post(cfg["llm"]["url"], timeout=60, json={
+                "messages": [{"role": "user", "content": prompt}], "temperature": 0.7, "presence_penalty": 1.0,
+                "max_tokens": 150, "chat_template_kwargs": {"enable_thinking": False}})
+            text = re.sub(r"(?s)<think>.*?</think>", "", r.json()["choices"][0]["message"]["content"])
+            words = [re.sub(r"[^a-z' -]", "", w.lower()).strip() for w in re.split(r"[,\n]", text)]
+            break
+        except (httpx.HTTPError, KeyError, ValueError, IndexError):
+            time.sleep(3)
+    taken = {name.lower(), say_as.lower(), *aliases}
+    keep = []
+    for w in words + names.sound_alikes(phones, 20):
+        if (len(w) > 1 and w not in taken and len(w.split()) <= 2 and name.lower() not in w
+                and say_as.lower() not in w and not same_sound(w, phones)):
+            taken.add(w)
+            keep.append(w)
+    return keep[:12]
+
+
+def negatives(cfg, out, name, say_as, phones):
+    print("\nThe wake-word model also learns to ignore words that only sound like her name.")
+    words = sound_alikes(cfg, name, say_as, phones, out.get(("ears", "wake_words"), []))
+    edited = ask("  Sound-alikes (comma-separated; add any your household says a lot)", ", ".join(words))
+    out[("wake", "negatives")] = [f"hey {w.strip().lower()}" for w in edited.split(",") if w.strip()]
+
+
+def start_services():
+    section("Starting her up")
+    systemctl("daemon-reload")
+    for u in ("foidbot-aec", "foidbot-llm", "foidbot"):
+        systemctl("enable", "--now", u)
+    if systemctl("cat", "foidbot-searxng").returncode == 0:
+        systemctl("start", "foidbot-searxng")
+        systemctl("enable", "foidbot-searxng")   # no-op for podman quadlets, which start via [Install]
+    subprocess.run(["pkill", "-f", f"{ROOT}/widget/widget.py"], capture_output=True)
+    subprocess.Popen([str(ROOT / ".venv/bin/python"), str(ROOT / "widget/widget.py")], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(30):
+        if systemctl("is-active", "foidbot").stdout.strip() == "active":
+            break
+        time.sleep(1)
+    print("  She's in the corner of your screen. Click her, press your shortcut, or just say her name.")
+    print("  (Tip: bind a keyboard shortcut to  foidbot-ctl listen  in your desktop settings.)")
+
+
+def enroll(name):
+    section("Your voice")
+    print(f"About 6 minutes: you read 20 short sentences and say \"Hey {name}\" 24 ways. This lets her recognize "
+          "you (so you can talk over her, and she knows when someone else is around) and makes her wake word "
+          "much more reliable for your voice.")
+    if yes("Record now?"):
+        subprocess.run([str(ROOT / "bin/foidbot-enroll")])
+    else:
+        print("  Later:  foidbot-enroll")
+
+
+def train(name, renamed):
+    section("Her wake word")
+    has_model = (ROOT / "models/wake.onnx").exists()
+    print(f"Until her wake-word model is trained she still wakes when Whisper hears \"{name}\", which works but "
+          "costs more GPU and is less reliable in a noisy room. Training builds a small model just for her name:\n"
+          "  • about 1-2 hours on a recent NVIDIA GPU (it runs in the background; you can use the computer)\n"
+          "  • a one-time download of ~22 GB of training data, about 40 GB of free disk while it runs\n"
+          "  • on GPUs under 16 GB her brain pauses during the heavy parts, so she can't answer then")
+    if has_model and not renamed and not yes("A wake-word model already exists. Train a new one?", False):
+        return
+    if not yes("Train it now?"):
+        print("  Later:  foidbot-train-wake    (progress:  foidbot-train-wake --status)")
+        return
+    quick = yes("Quick mode? (about half the time, slightly less accurate)", False)
+    if not (ROOT / "wakeword/.venv/bin/python").exists():
+        if subprocess.run([str(ROOT / "setup/install-train.sh")]).returncode:
+            print("  The training environment didn't install; see the messages above, then run foidbot-train-wake.")
+            return
+    systemctl("stop", "foidbot-train-wake")
+    systemctl("reset-failed", "foidbot-train-wake")
+    cmd = ["systemd-run", "--user", "--unit=foidbot-train-wake", "--collect", f"--working-directory={ROOT}",
+           str(ROOT / "bin/foidbot-train-wake"), *(["--quick"] if quick else [])]
+    if subprocess.run(cmd, capture_output=True).returncode == 0:
+        print("  Training started in the background. Check on it any time:  foidbot-train-wake --status\n"
+              "  She restarts with the new model by herself when it's done.")
+    else:
+        print("  Couldn't start it in the background; run  foidbot-train-wake  in a terminal instead.")
+
+
+def main():
+    args = set(sys.argv[1:])
+    if args & {"-h", "--help"}:
+        sys.exit(__doc__)
+    if not (ROOT / "models/kokoro-v1.0.onnx").exists():
+        sys.exit("Run ./install.sh first.")
+    print(bold("foidbot setup") + "  —  Enter keeps the value in [brackets].")
+    cfg = config.load()
+    systemctl("start", "foidbot-llm")   # loads in the background; she needs it for one step below
+    voice = Voice()
+    out = {}
+    if "--rename" in args:
+        v = cfg["assistant"]["voice"]
+        name, say_as, phones, renamed = her_name(cfg, out, voice, v)
+    else:
+        about_you(cfg, out)
+        v = her_voice(cfg, out, voice)
+        name, say_as, phones, renamed = her_name(cfg, out, voice, v)
+        personality(cfg, out, name)
+        notes(cfg, out, name)
+    for (sec, key), val in out.items():
+        cfg[sec][key] = val
+    if renamed or not cfg["wake"].get("negatives") or "--rename" in args:
+        wake_words(cfg, out, name, say_as, voice)
+        negatives(cfg, out, name, say_as, phones)
+    save(out)
+    print(f"\nSaved {config.CONFIG.relative_to(ROOT)}.")
+    if "--rename" not in args:
+        start_services()
+        enroll(name)
+    else:
+        systemctl("restart", "foidbot")
+    if "--rename" in args and any((ROOT / "data/voice/wake").glob("*.wav")):
+        print(f"\nYour old wake recordings say the old name. Re-record them with  foidbot-enroll --wake  "
+              f"before training, or training will skip them.")
+        if yes("Re-record them now?"):
+            shutil.rmtree(ROOT / "data/voice/wake", ignore_errors=True)
+            subprocess.run([str(ROOT / "bin/foidbot-enroll"), "--wake"])
+    train(name, renamed)
+    print(f"\n{bold('All set.')} Say “Hey {name}”.  Settings: config/foidbot.toml   Logs: data/transcripts/\n"
+          "Commands: foidbot-ctl (listen/stop/mode/mute), foidbot-enroll, foidbot-train-wake, foidbot-onboard")
+
+
+if __name__ == "__main__":
+    main()

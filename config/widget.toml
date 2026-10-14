@@ -1,0 +1,5 @@
+# Widget look. Restart the widget after editing.
+corner = "bottom-right"   # bottom-right, bottom-left, top-right, top-left
+avatar_width = 240
+avatar_height = 320
+margin = 12

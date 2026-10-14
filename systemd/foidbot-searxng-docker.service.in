@@ -1,0 +1,12 @@
+# Docker variant of foidbot-searxng (install.sh uses this when podman isn't installed)
+[Unit]
+Description=SearXNG for foidbot (docker)
+
+[Service]
+ExecStartPre=-/usr/bin/env docker rm -f foidbot-searxng
+ExecStart=/usr/bin/env docker run --rm --name foidbot-searxng -p 127.0.0.1:8888:8080 -v @ROOT@/data/searxng:/etc/searxng docker.io/searxng/searxng:latest
+ExecStop=/usr/bin/env docker stop foidbot-searxng
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

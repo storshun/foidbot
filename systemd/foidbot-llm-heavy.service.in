@@ -1,0 +1,10 @@
+[Unit]
+Description=foidbot heavy brain (Qwythos-27B, started on demand for website tasks, port 8092)
+
+[Service]
+Environment=LD_LIBRARY_PATH=@ROOT@/vendor/llama
+ExecStart=@ROOT@/vendor/llama/llama-server \
+  --model @ROOT@/models/Qwythos-27B-MTP-Q4_K_M.gguf \
+  --alias foidbot-heavy -c 16384 -fa on -ctk q8_0 -ctv q8_0 -ngl 99 \
+  --spec-type draft-mtp --jinja --host 127.0.0.1 --port 8092
+Restart=no

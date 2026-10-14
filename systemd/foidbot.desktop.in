@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=foidbot
+Comment=Local voice assistant widget
+Exec=@ROOT@/.venv/bin/python @ROOT@/widget/widget.py
+Icon=@ROOT@/assets/icon.png
+Categories=Utility;
+X-GNOME-Autostart-enabled=true

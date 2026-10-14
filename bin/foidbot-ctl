@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""foidbot-ctl listen | stop | say <text> | mode auto|private|company | mute on|off"""
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+VENV = ROOT / ".venv"
+if Path(sys.prefix).resolve() != VENV.resolve() and (VENV / "bin/python").exists():
+    os.execv(str(VENV / "bin/python"), [str(VENV / "bin/python"), __file__, *sys.argv[1:]])
+sys.path.insert(0, str(ROOT / "daemon"))
+from config import load  # noqa: E402
+from websockets.sync.client import connect  # noqa: E402
+
+args = sys.argv[1:] or ["listen"]
+cmd = args[0]
+msg = {"listen": {"t": "listen"}, "stop": {"t": "stop"}}.get(cmd)
+if cmd == "say":
+    msg = {"t": "text", "text": " ".join(args[1:])}
+elif cmd == "mode":
+    msg = {"t": "mode", "setting": args[1]}
+elif cmd == "mute":
+    msg = {"t": "mute", "on": args[1] == "on"}
+if not msg:
+    sys.exit(__doc__)
+try:
+    with connect(f"ws://127.0.0.1:{load()['daemon'].get('port', 8770)}", open_timeout=2) as ws:
+        ws.recv(timeout=2)  # initial state
+        ws.send(json.dumps(msg))
+except OSError:
+    sys.exit("The foidbot daemon isn't running (systemctl --user start foidbot)")

@@ -1,0 +1,15 @@
+# Podman quadlet: private SearXNG for her web searches (localhost only)
+[Unit]
+Description=SearXNG for foidbot
+
+[Container]
+Image=docker.io/searxng/searxng:latest
+ContainerName=foidbot-searxng
+PublishPort=127.0.0.1:8888:8080
+Volume=@ROOT@/data/searxng:/etc/searxng:Z
+
+[Service]
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

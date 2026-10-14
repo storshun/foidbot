@@ -1,0 +1,126 @@
+# The avatar: which expression (frames/<name>.png) she shows for each state and mood.
+# Rebuild frames after changing src/ art:  bin/foidbot-build-avatar   (the widget hot-reloads this file and frames/)
+#
+# base       expressions to show; one is picked at random each time the state/mood starts (variety)
+# variants   idle only: expressions she drifts between every so often while nothing is happening
+# mouth      lip-sync overlay family while she talks: neutral | smile | angry | none
+# intro      expression held for intro_secs at the start (e.g. a laugh before she settles into a grin)
+#
+# Lip sync: quiet sounds -> mouth_<family>_small, mid -> _mid, loud open vowels -> _wide (built from
+#   neutral: look_away / horrified / shocked    smile: grin_2 / grin / laugh    angry: look_away / rage / yell)
+
+# Expressions whose eyes are already closed, squinted or very wide: no blink overlay on these.
+no_blink = ["wink", "squinting_smile", "laugh", "sleep", "yawn", "silly_face", "surprised", "shocked",
+            "horrified", "anger", "rage", "anguish", "disgusted", "yell", "sob", "annoyed_or_angry"]
+
+# ---- states (what she is doing) ---------------------------------------------
+[state.idle]
+base = ["smile_5"]                       # calm, gentle half-smile, eyes on you
+variants = ["smile_5", "neutral", "smile_2"]
+mouth = "neutral"
+
+[state.listening]
+base = ["happiness"]                     # eyes bright and open, lips just parted: attentive
+mouth = "none"
+
+[state.thinking]
+base = ["remember_fondly"]               # eyes up and aside, recalling
+mouth = "none"
+
+[state.working]
+base = ["look_away"]                     # eyes off to the side, reading something
+mouth = "none"
+
+[state.sleep]
+base = ["sleep"]
+intro = "yawn"
+intro_secs = 1.8
+mouth = "none"
+
+# ---- public moods (the [tag] she starts each reply with) ---------------------
+[mood.calm]
+base = ["neutral", "smile_5"]
+mouth = "neutral"
+
+[mood.happy]
+base = ["smile_3", "smile_6", "gentle_smile", "smile_4"]
+mouth = "smile"
+
+[mood.amused]
+base = ["grin_3", "big_grin", "grin"]
+intro = "laugh"
+intro_secs = 1.2
+mouth = "smile"
+
+[mood.thinking]
+base = ["look_away"]
+mouth = "neutral"
+
+[mood.concerned]
+base = ["concern", "worry"]
+mouth = "neutral"
+
+[mood.sympathetic]
+base = ["pained_smile"]                  # soft smile with raised brows: comforting
+mouth = "neutral"
+
+[mood.sad]
+base = ["cry", "disappointed"]
+mouth = "neutral"
+
+[mood.surprised]
+base = ["surprised"]
+intro = "shocked"
+intro_secs = 0.8
+mouth = "neutral"
+
+[mood.annoyed]
+base = ["frown_2", "frown"]
+mouth = "neutral"
+
+[mood.alert]
+base = ["annoyed"]                       # stern and focused: severe weather, scams, danger
+mouth = "neutral"
+
+[mood.angry]
+base = ["anger", "annoyed_or_angry", "rage"]
+mouth = "angry"
+
+[mood.disgusted]
+base = ["disgusted", "anguish"]
+mouth = "angry"
+
+[mood.horrified]
+base = ["horrified"]
+intro = "shocked"
+intro_secs = 0.8
+mouth = "neutral"
+
+[mood.heartbroken]
+base = ["sob"]
+mouth = "neutral"
+
+# ---- private moods (only when it's just the user) -----------------------------
+[mood.playful]
+base = ["knowing_smile", "smile", "squinting_smile"]
+mouth = "smile"
+
+[mood.wink]
+base = ["wink"]
+mouth = "smile"
+
+[mood.flustered]
+base = ["blush"]
+mouth = "smile"
+
+[mood.sultry]
+base = ["annoyance", "te_me"]            # half-lidded, lips parted / smug and unhurried
+mouth = "neutral"
+
+[mood.smug]
+base = ["te_me"]
+mouth = "neutral"
+
+[mood.silly]
+base = ["silly_face"]                    # tongue out; no lip sync so the tongue stays
+mouth = "none"
