@@ -76,7 +76,7 @@ def need(path, gb):
 
 def cuda_version():
     out = subprocess.run(["nvidia-smi"], capture_output=True, text=True).stdout
-    m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", out)
+    m = re.search(r"CUDA (?:UMD )?Version:\s*(\d+)\.(\d+)", out)   # newer drivers say "CUDA UMD Version"
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
@@ -93,9 +93,11 @@ def llama():
             t.extractall(VENDOR / "tmp", filter="data")
     dest.mkdir(parents=True, exist_ok=True)
     for f in (VENDOR / "tmp").rglob("*"):
-        if f.is_file():
+        if f.is_file() or f.is_symlink():   # library symlinks point at siblings, so they stay valid in one folder
             shutil.move(str(f), dest / f.name)
-            (dest / f.name).chmod(0o755)
+    for f in dest.iterdir():
+        if not f.is_symlink():
+            f.chmod(0o755)
     shutil.rmtree(VENDOR / "tmp")
     for name in ("llama", "cudart-llama"):
         (VENDOR / f"{name}-{cuda}.tar.gz").unlink(missing_ok=True)
